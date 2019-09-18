@@ -34,13 +34,13 @@ var (
 	motionGRPCAddress            = "mirror.local:5555"
 	wakupAddress                 = "http://mirror.local:9080/"
 	wakupThrottle                = 10 * time.Second
-	mbx                          = 104
-	mby                          = 78
+	mbx                  int64   = 104
+	mby                  int64   = 78
 )
 
 func init() {
 	flag.DurationVar(&throttle, "throttle", throttle, "throttle motion detection to save CPU")
-	flag.DurationVar(&wakupThrottle, "wakeupThrottle", wakupThrottle, "minimum time before wakup signals are sent")
+	flag.DurationVar(&wakupThrottle, "wakeupthrottle", wakupThrottle, "minimum time before wakup signals are sent")
 	flag.StringVar(&processMotionAddress, "servinggrpc", processMotionAddress, "GRPC address to TensorFlow Serving for Motion Processing")
 	flag.StringVar(&modelName, "model", modelName, "TensorFlow Serving Model Name")
 	flag.StringVar(&signatureName, "signature", signatureName, "TensorFlow Serving Model Signature Name")
@@ -49,8 +49,9 @@ func init() {
 	flag.StringVar(&outputName, "modeloutput", outputName, "TensorFlow Serving Model Output Name")
 	flag.StringVar(&motionGRPCAddress, "motiongrpc", motionGRPCAddress, "GRPC address of motion data")
 	flag.StringVar(&modelName, "modelName", modelName, "name of motion processing model in tensorflow serving")
-	flag.IntVar(&mbx, "mbx", mbx, "macro blocks in X direction")
-	flag.IntVar(&mby, "mby", mby, "macro blocks in y direction")
+	flag.StringVar(&wakupAddress, "wakeupurl", wakupAddress, "http URL for posting wakup messages")
+	flag.Int64Var(&mbx, "mbx", mbx, "macro blocks in X direction")
+	flag.Int64Var(&mby, "mby", mby, "macro blocks in y direction")
 
 }
 
@@ -83,8 +84,32 @@ func serialCalculateMotionFroMVectors(body []byte, mbx, mby int) (float64, error
 	return tot, nil
 }
 
-func calculateMotionFromVectors(predictClient pb.PredictionServiceClient, body []byte, mbx, mby int) (float32, error) {
-	request := &pb.PredictRequest{
+type MotionCalculator struct {
+	ServingAddr   string
+	ModelName     string
+	SignatureName string
+	Version       int64
+	InputName     string
+	OutputName    string
+	MBX           int64
+	MBY           int64
+
+	conn   *grpc.ClientConn
+	client pb.PredictionServiceClient
+	req    *pb.PredictRequest
+}
+
+func (m *MotionCalculator) Open() error {
+	var err error
+
+	m.conn, err = grpc.Dial(processMotionAddress, grpc.WithInsecure())
+	if err != nil {
+		return err
+	}
+
+	m.client = pb.NewPredictionServiceClient(m.conn)
+
+	m.req = &pb.PredictRequest{
 		ModelSpec: &pb.ModelSpec{
 			Name:          modelName,
 			SignatureName: signatureName,
@@ -103,12 +128,20 @@ func calculateMotionFromVectors(predictClient pb.PredictionServiceClient, body [
 						&tf_core_framework.TensorShapeProto_Dim{Size: int64(4)},
 					},
 				},
-				TensorContent: body,
 			},
 		},
 	}
+	return nil
+}
 
-	res, err := predictClient.Predict(context.Background(), request)
+func (m *MotionCalculator) Close() {
+	m.conn.Close()
+}
+
+func (m *MotionCalculator) Calculate(body []byte) (float32, error) {
+	m.req.Inputs[inputName].TensorContent = body
+
+	res, err := m.client.Predict(context.Background(), m.req)
 	if err != nil {
 		return 0, err
 	}
@@ -123,13 +156,20 @@ func calculateMotionFromVectors(predictClient pb.PredictionServiceClient, body [
 func main() {
 	flag.Parse()
 
-	conn, err := grpc.Dial(processMotionAddress, grpc.WithInsecure())
-	if err != nil {
-		log.Fatalf("error connecting to serving: %v", err)
+	calc := &MotionCalculator{
+		ServingAddr:   processMotionAddress,
+		ModelName:     modelName,
+		SignatureName: signatureName,
+		Version:       modelVersion,
+		InputName:     inputName,
+		OutputName:    outputName,
+		MBX:           mbx,
+		MBY:           mby,
 	}
-	defer conn.Close()
-
-	predictClient := pb.NewPredictionServiceClient(conn)
+	if err := calc.Open(); err != nil {
+		log.Fatalf("error opening tf-serving connection: %v", err)
+	}
+	defer calc.Close()
 
 	motConn, err := grpc.Dial(motionGRPCAddress, grpc.WithInsecure())
 	if err != nil {
@@ -156,7 +196,7 @@ func main() {
 
 		body := frame.GetData()
 
-		if motion, err := calculateMotionFromVectors(predictClient, body, mbx, mby); err != nil {
+		if motion, err := calc.Calculate(body); err != nil {
 			log.Printf("error calculating motion: %v", err)
 		} else if motion > totalAverageMotion {
 			if time.Now().Sub(lastWakeup) > wakupThrottle {
