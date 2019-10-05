@@ -36,6 +36,7 @@ var (
 	wakupThrottle                = 10 * time.Second
 	mbx                  int64   = 104
 	mby                  int64   = 78
+	calculateLocal               = false
 )
 
 func init() {
@@ -52,7 +53,7 @@ func init() {
 	flag.StringVar(&wakupAddress, "wakeupurl", wakupAddress, "http URL for posting wakup messages")
 	flag.Int64Var(&mbx, "mbx", mbx, "macro blocks in X direction")
 	flag.Int64Var(&mby, "mby", mby, "macro blocks in y direction")
-
+	flag.BoolVar(&calculateLocal, "calculateLocal", calculateLocal, "calculate the motion locally on the CPU")
 }
 
 type motionVector struct {
@@ -150,7 +151,11 @@ func (m *MotionCalculator) Calculate(body []byte) (float32, error) {
 	if !ok {
 		return 0, fmt.Errorf("output '%s' not found", outputName)
 	}
-	return o.GetFloatVal()[0], nil
+	tot := o.GetFloatVal()[0]
+
+	// log.Printf("motion: %f", tot)
+
+	return tot, nil
 }
 
 func main() {
@@ -166,10 +171,13 @@ func main() {
 		MBX:           mbx,
 		MBY:           mby,
 	}
-	if err := calc.Open(); err != nil {
-		log.Fatalf("error opening tf-serving connection: %v", err)
+
+	if !calculateLocal {
+		if err := calc.Open(); err != nil {
+			log.Fatalf("error opening tf-serving connection: %v", err)
+		}
+		defer calc.Close()
 	}
-	defer calc.Close()
 
 	motConn, err := grpc.Dial(motionGRPCAddress, grpc.WithInsecure())
 	if err != nil {
@@ -185,8 +193,11 @@ func main() {
 
 	lastWakeup := time.Time{}
 
+	var motion float32
+
 	for {
 		t := time.Now()
+		motion = 0.
 
 		frame, err := client.Recv()
 		if err != nil {
@@ -196,9 +207,21 @@ func main() {
 
 		body := frame.GetData()
 
-		if motion, err := calc.Calculate(body); err != nil {
+		if calculateLocal {
+			m, err := serialCalculateMotionFroMVectors(body, int(mbx), int(mby))
+
+			if err != nil {
+				log.Printf("error calculating motion: %v", err)
+				continue
+			}
+
+			motion = float32(m)
+		} else if motion, err = calc.Calculate(body); err != nil {
 			log.Printf("error calculating motion: %v", err)
-		} else if motion > totalAverageMotion {
+			continue
+		}
+
+		if motion > totalAverageMotion {
 			if time.Now().Sub(lastWakeup) > wakupThrottle {
 				log.Printf("waking up")
 
